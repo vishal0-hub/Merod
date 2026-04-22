@@ -1,10 +1,9 @@
-from django.contrib.auth import login as django_login
 from django.contrib.auth import get_user_model
-from django.contrib.auth import update_session_auth_hash
 from django.contrib.auth.tokens import default_token_generator
 from django.utils.http import urlsafe_base64_decode, urlsafe_base64_encode
 from django.utils.encoding import force_bytes, force_str
 from rest_framework import status
+from rest_framework.authtoken.models import Token
 from rest_framework.response import Response
 from rest_framework.views import APIView
 from rest_framework.permissions import IsAuthenticated
@@ -16,9 +15,21 @@ from .serializers import (
     PasswordResetRequestSerializer,
     RegisterSerializer,
 )
-from .utils import get_session_key, get_session_store, get_user_id_from_session, normalize_email
+from .serializers_api_keys import ApiKeySerializer
+from .models import ApiKey
+from .utils import normalize_email
 
 User = get_user_model()
+
+
+def issue_token_for_user(user):
+    token, _ = Token.objects.get_or_create(user=user)
+    return token
+
+
+def rotate_token_for_user(user):
+    Token.objects.filter(user=user).delete()
+    return Token.objects.create(user=user)
 
 
 class AuthHealthView(APIView):
@@ -27,6 +38,8 @@ class AuthHealthView(APIView):
 
 
 class RegisterView(APIView):
+    authentication_classes = []
+
     def post(self, request):
         data = request.data.copy()
         email = data.get('email')
@@ -36,12 +49,14 @@ class RegisterView(APIView):
         serializer = RegisterSerializer(data=data)
         serializer.is_valid(raise_exception=True)
         user = serializer.save()
+        token = issue_token_for_user(user)
         return Response(
             {
                 'message': 'User created successfully',
                 'user_id': user.id,
                 'username': user.username,
                 'email': user.email,
+                'token': token.key,
             },
             status=status.HTTP_201_CREATED,
         )
@@ -54,7 +69,7 @@ class LoginView(APIView):
         serializer = LoginSerializer(data=request.data)
         serializer.is_valid(raise_exception=True)
         user = serializer.validated_data['user']
-        django_login(request, user)
+        token = issue_token_for_user(user)
 
         return Response(
             {
@@ -62,25 +77,18 @@ class LoginView(APIView):
                 'user_id': user.id,
                 'username': user.username,
                 'email': user.email,
-                'session_key': request.session.session_key,
+                'token': token.key,
             },
             status=status.HTTP_200_OK,
         )
 
 
 class LogoutView(APIView):
-    authentication_classes = []
+    permission_classes = [IsAuthenticated]
 
     def post(self, request):
-        session_key = get_session_key(request)
-
-        if not session_key:
-            return Response(
-                {'message': 'Session key is required. Send the session_key from login or keep cookies enabled.'},
-                status=status.HTTP_400_BAD_REQUEST,
-            )
-
-        get_session_store(session_key).delete()
+        if hasattr(request, 'auth') and request.auth:
+            request.auth.delete()
         return Response({'message': 'Logout successful'}, status=status.HTTP_200_OK)
 
 
@@ -101,47 +109,31 @@ class MeView(APIView):
 
 
 class ChangePasswordView(APIView):
-    authentication_classes = []
+    permission_classes = [IsAuthenticated]
 
     def post(self, request):
-        session_key = get_session_key(request)
-
-        if not session_key:
-            return Response(
-                {'message': 'Session key is required. Send the session_key from login or keep cookies enabled.'},
-                status=status.HTTP_400_BAD_REQUEST,
-            )
-
-        user_id = get_user_id_from_session(session_key)
-
-        if not user_id:
-            return Response({'message': 'No active session found.'}, status=status.HTTP_401_UNAUTHORIZED)
-
-        try:
-            user = User.objects.get(pk=user_id)
-        except User.DoesNotExist:
-            return Response({'message': 'No active session found.'}, status=status.HTTP_401_UNAUTHORIZED)
-
-        serializer = PasswordChangeSerializer(data=request.data, context={'request': request, 'user': user})
+        user = request.user
+        serializer = PasswordChangeSerializer(data=request.data, context={'request': request})
         serializer.is_valid(raise_exception=True)
 
         user.set_password(serializer.validated_data['new_password'])
         user.save()
-
-        django_request = request._request
-        django_request.user = user
-        update_session_auth_hash(django_request, user)
+        if hasattr(request, 'auth') and request.auth:
+            request.auth.delete()
+        token = rotate_token_for_user(user)
 
         return Response(
             {
                 'message': 'Password changed successfully',
-                'session_key': session_key,
+                'token': token.key,
             },
             status=status.HTTP_200_OK,
         )
 
 
 class PasswordResetRequestView(APIView):
+    authentication_classes = []
+
     def post(self, request):
         serializer = PasswordResetRequestSerializer(data=request.data)
         serializer.is_valid(raise_exception=True)
@@ -167,6 +159,8 @@ class PasswordResetRequestView(APIView):
 
 
 class PasswordResetConfirmView(APIView):
+    authentication_classes = []
+
     def post(self, request):
         serializer = PasswordResetConfirmSerializer(data=request.data)
         serializer.is_valid(raise_exception=True)
@@ -182,4 +176,82 @@ class PasswordResetConfirmView(APIView):
 
         user.set_password(serializer.validated_data['new_password'])
         user.save()
+        Token.objects.filter(user=user).delete()
         return Response({'message': 'Password has been reset successfully'}, status=status.HTTP_200_OK)
+
+
+class ApiKeyListCreateView(APIView):
+    permission_classes = [IsAuthenticated]
+
+    def get(self, request):
+        api_keys = ApiKey.objects.filter(user=request.user).order_by('-created_at')
+        serializer = ApiKeySerializer(api_keys, many=True)
+        return Response(
+            {
+                'count': api_keys.count(),
+                'results': serializer.data,
+            },
+            status=status.HTTP_200_OK,
+        )
+
+    def post(self, request):
+        serializer = ApiKeySerializer(data=request.data)
+        serializer.is_valid(raise_exception=True)
+        api_key = serializer.save(user=request.user)
+
+        return Response(
+            {
+                'message': 'API key created successfully',
+                'data': ApiKeySerializer(api_key).data,
+                'api_key': getattr(api_key, 'plain_text_key', None),
+            },
+            status=status.HTTP_201_CREATED,
+        )
+
+
+class ApiKeyDetailView(APIView):
+    permission_classes = [IsAuthenticated]
+
+    def get_object(self, user, pk):
+        return ApiKey.objects.get(pk=pk, user=user)
+
+    def get(self, request, pk):
+        try:
+            api_key = self.get_object(request.user, pk)
+        except ApiKey.DoesNotExist:
+            return Response({'message': 'API key not found.'}, status=status.HTTP_404_NOT_FOUND)
+
+        return Response(
+            {
+                'data': ApiKeySerializer(api_key).data,
+            },
+            status=status.HTTP_200_OK,
+        )
+
+    def patch(self, request, pk):
+        try:
+            api_key = self.get_object(request.user, pk)
+        except ApiKey.DoesNotExist:
+            return Response({'message': 'API key not found.'}, status=status.HTTP_404_NOT_FOUND)
+
+        serializer = ApiKeySerializer(api_key, data=request.data, partial=True)
+        serializer.is_valid(raise_exception=True)
+        api_key = serializer.save()
+
+        return Response(
+            {
+                'message': 'API key updated successfully',
+                'data': ApiKeySerializer(api_key).data,
+                'api_key': getattr(api_key, 'plain_text_key', None),
+            },
+            status=status.HTTP_200_OK,
+        )
+
+    def delete(self, request, pk):
+        try:
+            api_key = self.get_object(request.user, pk)
+        except ApiKey.DoesNotExist:
+            return Response({'message': 'API key not found.'}, status=status.HTTP_404_NOT_FOUND)
+
+        api_key.delete()
+        return Response({'message': 'API key deleted successfully'}, status=status.HTTP_200_OK)

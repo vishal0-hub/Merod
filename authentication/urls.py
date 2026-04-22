@@ -2,6 +2,8 @@ from django.urls import path
 
 from .views import (
     AuthHealthView,
+    ApiKeyDetailView,
+    ApiKeyListCreateView,
     ChangePasswordView,
     LoginView,
     LogoutView,
@@ -20,4 +22,6 @@ urlpatterns = [
     path('change-password/', ChangePasswordView.as_view(), name='change-password'),
     path('password-reset/request/', PasswordResetRequestView.as_view(), name='password-reset-request'),
     path('password-reset/confirm/', PasswordResetConfirmView.as_view(), name='password-reset-confirm'),
+    path('api-keys/', ApiKeyListCreateView.as_view(), name='api-key-list-create'),
+    path('api-keys/<int:pk>/', ApiKeyDetailView.as_view(), name='api-key-detail'),
 ]
